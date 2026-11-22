@@ -16,3 +16,9 @@ node_modules/
 __pycache__/
 .venv/
 venv/
+
+# 原始下载数据与可重建的缓存 (pygeoloc/data/*.npz 已随仓库提供, 不忽略)
+data/raw/
+data/cache/
+web/data/
+__pycache__/*.pyc

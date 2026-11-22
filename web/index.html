@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>时延测量定位 · 探测点圆与置信区域</title>
+<style>
+  :root { --bg:#0b0f14; --panel:#111821; --line:#1f2a37; --txt:#d7e0ea; --dim:#7d8b9c;
+          --acc:#4ea8ff; --warn:#ffb454; --bad:#ff5d5d; --ok:#4ade80; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+              font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+  #app { display:flex; height:100%; }
+  #mapwrap { position:relative; flex:1; min-width:0; }
+  canvas { display:block; width:100%; height:100%; cursor:grab; background:#070b10; }
+  canvas.drag { cursor:grabbing; }
+  #side { width:340px; border-left:1px solid var(--line); background:var(--panel);
+          overflow-y:auto; padding:12px 14px; }
+  #side h1 { font-size:15px; margin:0 0 2px; letter-spacing:.3px; }
+  #side .sub { color:var(--dim); font-size:11px; margin-bottom:12px; }
+  .case-list { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .chip { border:1px solid var(--line); background:#0d141c; color:var(--dim);
+          padding:3px 8px; border-radius:12px; cursor:pointer; font-size:11px; }
+  .chip.on { border-color:var(--acc); color:var(--acc); background:#0e1a26; }
+  .row { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px dashed #1a2431; }
+  .row span:first-child { color:var(--dim); }
+  .k { font-variant-numeric:tabular-nums; }
+  .good { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .lg { display:flex; align-items:center; gap:6px; margin:5px 0; color:var(--dim); font-size:11px; }
+  .sw { width:22px; height:3px; border-radius:2px; display:inline-block; }
+  .hex { width:14px; height:14px; border-radius:7px; display:inline-block; }
+  #hint { position:absolute; left:12px; bottom:10px; color:#5d6b7c; font-size:11px; pointer-events:none; }
+  #scalebar { position:absolute; left:12px; top:10px; color:#7d8b9c; font-size:11px; }
+  .sec { margin-top:12px; color:#9fb0c3; font-size:11px; text-transform:uppercase; letter-spacing:.8px; }
+  code { color:#9ecbff; font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="mapwrap">
+    <canvas id="cv"></canvas>
+    <div id="scalebar"></div>
+    <div id="hint">滚轮缩放 · 拖动平移 · 双击复位</div>
+  </div>
+  <div id="side">
+    <h1>时延测量定位</h1>
+    <div class="sub">每个探测点画一个圆（RTT 经本点标定线换算的距离上界）—— 目标一定在所有圆的交集里。区域颜色越亮，人口×时延后验越高。</div>
+    <div class="case-list" id="cases"></div>
+    <div id="detail"></div>
+    <div class="sec">图例</div>
+    <div class="lg"><span class="sw" style="background:#4ea8ff"></span>探测点标定圆</div>
+    <div class="lg"><span class="sw" style="background:#ffb454"></span>末跳路由器锚点圆</div>
+    <div class="lg"><span class="sw" style="background:#4ade80;height:2px"></span>最终区域边界</div>
+    <div class="lg"><span class="hex" style="background:#ffd166"></span>点估计（后验峰/最大相容点）</div>
+    <div class="lg"><span class="hex" style="background:#ff5d5d"></span>真实位置（仅验收）</div>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let DATA = null, cur = 0, W = 0, H = 0, DPR = 1;
+let view = null, heatImg = null;
+
+function merc(lon, lat) {
+  const x = (lon + 180) / 360;
+  const l = Math.max(-85.05112878, Math.min(85.05112878, lat));
+  const y = (1 - Math.log(Math.tan(Math.PI/4 + l*Math.PI/360)) / Math.PI) / 2;
+  return [x, y];
+}
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+function fitView(v) { view = {x:v.x, y:v.y, w:v.w, h:v.h}; }
+function toScreen(x, y) {
+  return [ (x - view.x)/view.w * W, (y - view.y)/view.h * H ];
+}
+function fromScreen(px, py) {
+  return [ view.x + px/W*view.w, view.y + py/H*view.h ];
+}
+
+function pathPoly(pts, close) {
+  if (!pts || pts.length < 2) return;
+  ctx.beginPath();
+  const p0 = toScreen(pts[0][0], pts[0][1]);
+  ctx.moveTo(p0[0], p0[1]);
+  for (let i=1;i<pts.length;i++){ const p=toScreen(pts[i][0],pts[i][1]); ctx.lineTo(p[0],p[1]); }
+  if (close) ctx.closePath();
+}
+
+function drawWorld() {
+  const w = DATA.world;
+  ctx.lineWidth = 0.6;
+  ctx.strokeStyle = '#16222e'; ctx.fillStyle = '#0d151d';
+  for (const ring of w.land) { pathPoly(ring, true); ctx.fill(); ctx.stroke(); }
+  // cities
+  const t = 4;
+  for (const c of w.cities) {
+    const [x,y] = toScreen(c[0], c[1]);
+    if (x<-t||y<-t||x>W+t||y>H+t) continue;
+    const r = 0.6 + Math.min(3.2, Math.log10(c[2]) / 2.2);
+    ctx.fillStyle = 'rgba(150,185,220,0.35)';
+    ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  }
+  // probes
+  for (const p of DATA.probes) {
+    const [x,y] = toScreen(p[0], p[1]);
+    if (x<-4||y<-4||x>W+4||y>H+4) continue;
+    ctx.fillStyle = '#4ea8ff';
+    ctx.beginPath(); ctx.arc(x,y,2.0,0,Math.PI*2); ctx.fill();
+  }
+}
+
+function ringHitsView(ring) {
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for (const p of ring) { if(p[0]<x0)x0=p[0]; if(p[0]>x1)x1=p[0]; if(p[1]<y0)y0=p[1]; if(p[1]>y1)y1=p[1]; }
+  return !(x1 < view.x || x0 > view.x+view.w || y1 < view.y || y0 > view.y+view.h);
+}
+
+function drawCase() {
+  const c = DATA.cases[cur];
+  // circles
+  for (const f of c.circles) {
+    if (!ringHitsView(f.path)) continue;
+    if (f.kind === 'router') {
+      pathPoly(f.path, true);
+      ctx.strokeStyle = 'rgba(255,180,84,0.55)'; ctx.lineWidth = 1.0;
+      ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,180,84,0.05)'; ctx.fill();
+    } else {
+      pathPoly(f.path, true);
+      ctx.strokeStyle = 'rgba(78,168,255,0.42)'; ctx.lineWidth = 1.0; ctx.stroke();
+      ctx.fillStyle = 'rgba(78,168,255,0.045)'; ctx.fill();
+    }
+  }
+  // heatmap
+  if (c.heatmap && c.heat_extent) {
+    if (!heatImg || heatImg.dataset.src !== c.heatmap) {
+      heatImg = new Image();
+      heatImg.dataset.src = c.heatmap;
+      heatImg.src = c.heatmap;
+      heatImg.onload = draw;
+    }
+    const e = c.heat_extent;
+    const [x0,y0] = toScreen(e[0], e[1]);
+    const [x1,y1] = toScreen(e[0]+e[2], e[1]+e[3]);
+    ctx.globalAlpha = 0.92;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(heatImg, x0, y0, x1-x0, y1-y0);
+    ctx.globalAlpha = 1;
+  }
+  // region boundary
+  ctx.strokeStyle = 'rgba(74,222,128,0.95)'; ctx.lineWidth = 1.6;
+  for (const ring of c.polygons) { pathPoly(ring, true); ctx.stroke(); }
+  // point estimate
+  let p = toScreen(c.point[0], c.point[1]);
+  ctx.fillStyle = '#ffd166';
+  ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#1a1200'; ctx.lineWidth = 1.5; ctx.stroke();
+  // truth
+  if (c.truth) {
+    const [tx,ty] = merc(c.truth[1], c.truth[0]);
+    const q = toScreen(tx, ty);
+    ctx.strokeStyle = '#ff5d5d'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(q[0], q[1], 6, 0, Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(q[0]-9,q[1]); ctx.lineTo(q[0]+9,q[1]);
+    ctx.moveTo(q[0],q[1]-9); ctx.lineTo(q[0],q[1]+9); ctx.stroke();
+    // tie line
+    ctx.strokeStyle='rgba(255,93,93,0.35)'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+
+function draw() {
+  if (!DATA) return;
+  ctx.clearRect(0,0,W,H);
+  drawWorld();
+  drawCase();
+  updateScalebar();
+}
+
+function updateScalebar() {
+  // 视野中心纬度 -> 每像素 km
+  const yc = view.y + view.h/2;
+  const lat = Math.atan(Math.sinh(Math.PI*(1-2*yc))) * 180/Math.PI;
+  const kmPerPx = view.w * 40075 * Math.cos(lat*Math.PI/180) / W;
+  let target = 100;
+  const cands = [1,2,5,10,20,50,100,200,500,1000,2000,5000];
+  for (const c of cands) if (c/kmPerPx < 180) target = c;
+  const px = target/kmPerPx;
+  document.getElementById('scalebar').innerHTML =
+    `<div style="width:${px.toFixed(0)}px;border-bottom:1px solid #7d8b9c;height:6px"></div>${target} km`;
+}
+
+// ---------- interactions ----------
+let drag = null;
+cv.addEventListener('mousedown', e => { drag = {x:e.clientX, y:e.clientY, vx:view.x, vy:view.y}; cv.classList.add('drag'); });
+window.addEventListener('mouseup', () => { drag = null; cv.classList.remove('drag'); });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  const dx = (e.clientX - drag.x) / W * view.w, dy = (e.clientY - drag.y) / H * view.h;
+  view.x = drag.vx - dx; view.y = drag.vy - dy; draw();
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const [mx,my] = fromScreen(e.offsetX, e.offsetY);
+  const k = Math.exp(e.deltaY * 0.0012);
+  const nw = Math.min(1.5, Math.max(1e-6, view.w * k));
+  view.x = mx - (mx - view.x) * nw/view.w;
+  view.y = my - (my - view.y) * nw/view.w;
+  view.w = nw; view.h = nw * H / W;
+  draw();
+}, {passive:false});
+cv.addEventListener('dblclick', () => { fitView(DATA.cases[cur].view); draw(); });
+
+// ---------- side panel ----------
+function fmt(x, d=0) {
+  if (x === null || x === undefined || Number.isNaN(x)) return '—';
+  if (Math.abs(x) >= 1e6) return (x/1e6).toFixed(2)+'M';
+  return x.toLocaleString('zh-CN', {maximumFractionDigits:d});
+}
+function showCase(i) {
+  cur = i;
+  const c = DATA.cases[cur];
+  fitView(c.view); heatImg = null; draw();
+  document.querySelectorAll('.chip').forEach((el,k)=>el.classList.toggle('on', k===i));
+  const cls = c.confidence >= .8 ? 'good' : (c.confidence >= .5 ? 'warn' : 'bad');
+  const nCircles = c.circles.filter(f=>f.kind==='probe').length;
+  const relax = c.relax && c.relax.length
+      ? c.relax.map(r => r.a === 'expand' ? `${r.label} 放宽(+${Math.round(r.excess_km||0)}km)`
+                                         : (r.a === 'drop' ? `${r.label} 剔除` : r.a)).join('、')
+      : '无';
+  let err = '';
+  if (c.truth) {
+    const dy = (c.point_latlon[0]-c.truth[0])*111, dx = (c.point_latlon[1]-c.truth[1])*111*Math.cos(c.truth[0]*Math.PI/180);
+    err = Math.hypot(dx,dy);
+  }
+  document.getElementById('detail').innerHTML = `
+    <div class="row"><span>目标 #</span><span class="k">${c.tid}</span></div>
+    <div class="row"><span>点估计误差</span><span class="k ${err && err<50?'good':(err<200?'warn':'bad')}">${c.truth?fmt(err)+' km':'—'}</span></div>
+    <div class="row"><span>真值在区域内</span><span class="k ${c.covered?'good':'bad'}">${c.truth?(c.covered?'是':'否'):'—'}</span></div>
+    <div class="row"><span>区域面积</span><span class="k">${fmt(c.area_km2)} km²</span></div>
+    <div class="row"><span>点估计来源</span><span class="k">${c.point_src==='nearest_probe'?'最近 RTT 探测点':'后验峰'}</span></div>
+    <div class="row"><span>置信度</span><span class="k ${cls}">${(c.confidence*100).toFixed(0)}%</span></div>
+    <div class="row"><span>估出的接入/固定开销</span><span class="k">${c.overhead_ms.toFixed(1)} ms</span></div>
+    <div class="row"><span>约束数（圆）</span><span class="k">${c.n_constraints}${nCircles<c.n_constraints?'（画 '+nCircles+' 个）':''}</span></div>
+    <div class="row"><span>测量包数</span><span class="k">${fmt(c.packets)}</span></div>
+    <div class="row"><span>约束放宽</span><span class="k" style="max-width:180px;text-align:right">${relax}</span></div>
+    <div class="row"><span>末跳路由器</span><span class="k">${c.routers.length? c.routers.map(r=>r.method).slice(0,2).join(', ') : '—'}</span></div>
+    <div class="sec">怎么读</div>
+    <div style="color:var(--dim);font-size:11.5px;margin-top:4px">
+      蓝圈是各探测点的距离上界；真实位置必在所有蓝圈交叠处。绿线围出的区域是系统给出的答案，
+      颜色越亮表示人口/时延联合后验越高。黄点是点估计，红叉是真实位置（仅验收时出现）。
+    </div>`;
+  c.covered = c.truth ? c.covered : c.covered;
+}
+
+function buildChips() {
+  const box = document.getElementById('cases');
+  DATA.cases.forEach((c,i)=>{
+    const el = document.createElement('div');
+    el.className = 'chip' + (i===0?' on':'');
+    el.textContent = '#' + c.tid;
+    el.onclick = ()=>showCase(i);
+    box.appendChild(el);
+  });
+}
+
+fetch('data/demo.json').then(r=>r.json()).then(d=>{
+  DATA = d;
+  // compute covered client-side if truth present
+  for (const c of DATA.cases) {
+    c.covered = false;
+    if (c.truth && c.polygons) {
+      // point in polygon (mercator space, ring closed)
+      const [tx,ty] = merc(c.truth[1], c.truth[0]);
+      c.covered = c.polygons.some(ring => pip(tx,ty,ring));
+    }
+  }
+  buildChips(); resize(); showCase(0);
+}).catch(e=>{
+  document.getElementById('detail').innerHTML = '<div class="bad">无法加载 data/demo.json：'+e+'</div>';
+});
+
+function pip(x,y,ring) {
+  let inside=false;
+  for (let i=0,j=ring.length-1;i<ring.length;j=i++){
+    const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
+    if (((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+</script>
+</body>
+</html>
